@@ -1,0 +1,26 @@
+﻿Designator,Value,Layer,Reason,X (mm),Y (mm),Rotation
+C21,NC/10pF 50V,Bottom,NC/ in value,8.25,11.50,270
+C24,NC/10pF 50V,Bottom,NC/ in value,7.00,11.50,270
+L3,NC/BCMF062P120T,Top,NC/ in value,9.25,13.94,270
+L4,NC/BCMF062P120T,Top,NC/ in value,10.75,13.94,270
+L5,NC/BCMF062P120T,Top,NC/ in value,12.25,13.94,270
+L6,NC/BCMF062P120T,Top,NC/ in value,13.75,13.94,270
+MNT1,MOUNTHOLE_M2.5_4.8MM_PAD,Top,MOUNTHOLE in value,2.75,41.00,0
+MNT2,MOUNTHOLE_M2.5_4.8MM_PAD,Top,MOUNTHOLE in value,27.25,41.00,0
+MNT3,MOUNTHOLE_M2.5_4.8MM_PAD,Top,MOUNTHOLE in value,2.75,14.00,0
+MNT4,MOUNTHOLE_M2.5_4.8MM_PAD,Top,MOUNTHOLE in value,27.25,14.00,0
+R7,NC/2.2kΩ 1%,Bottom,NC/ in value,20.25,45.50,180
+R49,NC/0Ω 1%,Bottom,NC/ in value,18.38,44.00,90
+R50,NC/2.2kΩ 1%,Bottom,NC/ in value,25.50,45.50,180
+R52,NC/0Ω 1%,Bottom,NC/ in value,21.88,44.00,90
+R53,NC/2.2kΩ 1%,Bottom,NC/ in value,13.50,45.50,0
+R55,NC/0Ω 1%,Bottom,NC/ in value,14.88,44.00,90
+R59,NC/1kΩ 1%,Bottom,NC/ in value,4.13,30.50,90
+R60,NC/0Ω 1%,Top,NC/ in value,20.50,38.50,180
+R61,NC/1MΩ 1%,Top,NC/ in value,18.63,38.50,0
+R63,NC/100kΩ 1%,Bottom,NC/ in value,20.38,34.75,180
+TP1,TEST_POINT_1MM,Top,TEST_POINT in footprint,9.50,26.19,0
+TP2,TEST_POINT_1MM,Top,TEST_POINT in footprint,10.25,26.19,0
+TP3,TEST_POINT_1MM,Top,TEST_POINT in footprint,11.88,26.19,0
+TP4,TEST_POINT_1MM_0.5MM,Top,TEST_POINT in footprint,11.00,26.19,0
+U9,NC/ME2808A33XG,Bottom,NC/ in value,20.13,37.38,270

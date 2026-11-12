@@ -1,0 +1,198 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Device tree overlay: RK628H HDMI to MIPI CSI-2 bridge (rk628-22p board) on
+ * a Raspberry Pi Compute Module 4 camera port. Default is CAM1, four lanes.
+ *
+ * Build:  dtc -@ -Wno-unit_address_vs_reg -I dts -O dtb -o rk628.dtbo \
+ *             rk628-overlay.dts
+ * Use:    copy rk628.dtbo to /boot/firmware/overlays/, then in config.txt
+ *         dtoverlay=rk628
+ *         dtoverlay=rk628,int_gpio=<m>      (if pin 18 reaches a SoC GPIO)
+ *
+ * The 22-pin FPC carries the same signals in the same order as the Pi 22-pin
+ * camera connector. Pin 17 (Pi CAM_IO0, the camera power enable) is the RK628
+ * reset, active low. On a CM4 that pin is driven by the firmware GPIO
+ * expander, line 5, and that is the default here. If your carrier routes pin
+ * 17 to a SoC GPIO instead, use reset_gpio=<n>.
+ *
+ * Pin 18 (Pi CAM_IO1) is the RK628 interrupt. Where it goes depends on the
+ * carrier, so it is optional: without it the driver polls the bridge over I2C
+ * once a second. On the WarpKVM CM4 carrier it is GPIO26 (int_gpio=26).
+ *
+ * Copyright (C) 2026 Ground Plane Studio, LLC
+ */
+
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2835";
+
+	i2c_frag: fragment@0 {
+		target = <&i2c_csi_dsi>;
+		__overlay__ {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "okay";
+
+			rk628: rk628@50 {
+				compatible = "rockchip,rk628-csi-v4l2";
+				reg = <0x50>;
+				status = "okay";
+
+				port {
+					rk628_ep: endpoint {
+						remote-endpoint = <&csi_ep>;
+						clock-lanes = <0>;
+						/* Lane rates 700, 900, 1300, 1500, 1800 Mbps */
+						link-frequencies = /bits/ 64 <350000000 450000000
+									  650000000 750000000
+									  900000000>;
+					};
+				};
+			};
+		};
+	};
+
+	csi_frag: fragment@1 {
+		target = <&csi1>;
+		__overlay__ {
+			status = "okay";
+
+			port {
+				csi_ep: endpoint {
+					remote-endpoint = <&rk628_ep>;
+				};
+			};
+		};
+	};
+
+	fragment@2 {
+		target = <&i2c0if>;
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	fragment@3 {
+		target = <&i2c0mux>;
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	/* Non-continuous clock (default) on both ends of the link. */
+	fragment@4 {
+		target = <&rk628_ep>;
+		__overlay__ {
+			clock-noncontinuous;
+		};
+	};
+
+	fragment@5 {
+		target = <&csi_ep>;
+		__overlay__ {
+			clock-noncontinuous;
+		};
+	};
+
+	/* continuous_clk: the bridge keeps the clock lane in HS mode. */
+	fragment@6 {
+		target = <&rk628>;
+		__dormant__ {
+			continues-clk;
+		};
+	};
+
+	/* Four data lanes (default). */
+	fragment@7 {
+		target = <&rk628_ep>;
+		__overlay__ {
+			data-lanes = <1 2 3 4>;
+		};
+	};
+
+	fragment@8 {
+		target = <&csi_ep>;
+		__overlay__ {
+			data-lanes = <1 2 3 4>;
+		};
+	};
+
+	/* 2lane: for two-lane ports (CM4 CAM0, Pi 4B through an adapter). */
+	fragment@9 {
+		target = <&rk628_ep>;
+		__dormant__ {
+			data-lanes = <1 2>;
+		};
+	};
+
+	fragment@10 {
+		target = <&csi_ep>;
+		__dormant__ {
+			data-lanes = <1 2>;
+		};
+	};
+
+	/* Reset (default): camera power enable, firmware GPIO expander line 5. */
+	fragment@11 {
+		target = <&rk628>;
+		__overlay__ {
+			reset-gpios = <&expgpio 5 1>;
+		};
+	};
+
+	/*
+	 * The CM4 device tree turns that same expander line into a camera power
+	 * regulator (cam1_reg), which claims it and holds it low, keeping the
+	 * RK628 in reset. Here the pin is a reset, not a power switch, so the
+	 * regulator goes.
+	 */
+	fragment@14 {
+		target = <&cam1_reg>;
+		__overlay__ {
+			status = "disabled";
+		};
+	};
+
+	/* reset_gpio=<n>: RK628 RSTN on SoC GPIO n instead, active low (flag 1). */
+	fragment@13 {
+		target = <&rk628>;
+		rst: __dormant__ {
+			reset-gpios = <&gpio 0 1>;
+		};
+	};
+
+	/* int_gpio=<n>: RK628 interrupt on SoC GPIO n, level high (type 4). */
+	fragment@12 {
+		target = <&rk628>;
+		irq: __dormant__ {
+			interrupt-parent = <&gpio>;
+			interrupts = <0 4>;
+		};
+	};
+
+	/*
+	 * Use the legacy unicam driver (video node API, no media controller)
+	 * by default, as the tc358743 overlay does. media-controller drops this
+	 * fragment and leaves the mainline unicam driver bound.
+	 */
+	legacy_frag: fragment@100 {
+		target = <&csi1>;
+		__overlay__ {
+			compatible = "brcm,bcm2835-unicam-legacy";
+		};
+	};
+
+	__overrides__ {
+		reset_gpio = <0>, "-11-14+13", <&rst>, "reset-gpios:4";
+		int_gpio = <0>, "+12", <&irq>, "interrupts:0";
+		continuous_clk = <0>, "-4-5+6";
+		2lane = <0>, "-7-8+9+10";
+		media-controller = <0>, "!100";
+		cam0 = <&i2c_frag>, "target:0=", <&i2c_csi_dsi0>,
+		       <&csi_frag>, "target:0=", <&csi0>,
+		       <&legacy_frag>, "target:0=", <&csi0>;
+		i2s_enable = <&rk628>, "i2s-enable-default?";
+	};
+};

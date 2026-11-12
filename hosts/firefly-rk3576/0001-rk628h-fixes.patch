@@ -1,0 +1,834 @@
+RK628H fixes for the Rockchip BSP rk628 driver (kernel 6.1, develop-6.1)
+
+Modified by Ground Plane Studio, LLC, 2026. GPL-2.0, as the driver it patches.
+
+Fixes, all in the vendor driver:
+- HPD is raised again after a userspace VIDIOC_S_EDID on F/H silicon
+- the 1500 Mbps lane-rate clamp applies to RK628D only
+- full I2S pin mux plus a master clock out, for boards with an I2S DAC
+- the built-in EDID advertises basic audio
+- D-PHY test registers are programmed while the PHY is held in reset
+- CPLL at 1188 MHz so CEA pixel clocks divide exactly
+- sync width, implausible mode and timing table fixes at 297 MHz
+- dual MIPI only when the device tree declares the second port
+- a watchdog that recovers the chip after an HDMI replug wedge
+- continuous MIPI clock by default, needed above 60 Hz (a 'non-continuous-clk'
+  device tree property turns it off)
+
+diff --git a/drivers/media/i2c/rk628/rk628.c b/drivers/media/i2c/rk628/rk628.c
+index b57dbc8e3..88cf9b668 100644
+--- a/drivers/media/i2c/rk628/rk628.c
++++ b/drivers/media/i2c/rk628/rk628.c
+@@ -285,9 +285,13 @@ int rk628_media_i2c_write(struct rk628 *rk628, u32 reg, u32 val)
+ 	} else {
+ 		ret = regmap_write(rk628->regmap[region], reg, val);
+ 	}
+-	if (ret < 0)
++	if (ret < 0) {
++		atomic_inc(&rk628->i2c_errors);	/* see struct rk628 */
+ 		dev_err(rk628->dev,
+ 			"%s: i2c err reg=0x%x, val=0x%x, ret=%d\n", __func__, reg, val, ret);
++	} else {
++		atomic_set(&rk628->i2c_errors, 0);
++	}
+ 
+ 	return ret;
+ }
+@@ -311,9 +315,16 @@ int rk628_media_i2c_read(struct rk628 *rk628, u32 reg, u32 *val)
+ 	} else {
+ 		ret = regmap_read(rk628->regmap[region], reg, val);
+ 	}
+-	if (ret < 0)
++	/* Count consecutive failures so the watchdog can spot a bridge that
++	 * has fallen off the bus entirely. See struct rk628.
++	 */
++	if (ret < 0) {
++		atomic_inc(&rk628->i2c_errors);
+ 		dev_err(rk628->dev,
+ 			"%s: i2c err reg=0x%x, val=0x%x ret=%d\n", __func__, reg, *val, ret);
++	} else {
++		atomic_set(&rk628->i2c_errors, 0);
++	}
+ 
+ 	return ret;
+ }
+diff --git a/drivers/media/i2c/rk628/rk628.h b/drivers/media/i2c/rk628/rk628.h
+index 2002bf1e2..46341b9fa 100644
+--- a/drivers/media/i2c/rk628/rk628.h
++++ b/drivers/media/i2c/rk628/rk628.h
+@@ -298,6 +298,15 @@ struct rk628 {
+ 	struct device *dev;
+ 	struct i2c_client *client;
+ 	struct regmap *regmap[RK628_DEV_MAX];
++	/*
++	 * Consecutive I2C failures. The bridge can drop off the bus entirely
++	 * (every access returns -ETIMEDOUT), which happens after an HDMI
++	 * replug on a powered board. Nothing recovers it over I2C, because
++	 * I2C is what is broken; only a reset-GPIO cycle does. This counter
++	 * lets the watchdog notice and take that path. Cleared on any
++	 * successful access.
++	 */
++	atomic_t i2c_errors;
+ 	u8 version;
+ 	void *txphy;
+ 	u8 dphy_lane_en;
+diff --git a/drivers/media/i2c/rk628/rk628_cru.h b/drivers/media/i2c/rk628/rk628_cru.h
+index 7fad71faa..3f1107f7b 100644
+--- a/drivers/media/i2c/rk628/rk628_cru.h
++++ b/drivers/media/i2c/rk628/rk628_cru.h
+@@ -195,8 +195,15 @@
+ #define RGU_TXESC		30
+ #define RGU_CSI1		31
+ 
+-/* CTS HF2-6/HF2-23 test frequency +/-0.5%, (1188M * 1.005) */
+-#define CPLL_REF_CLK		1194000000
++/*
++ * Keep CPLL at 1188 MHz, the CEA 297 MHz family rate. sclk_vop is a
++ * fractional divider off CPLL; 1188 divides 297 and 148.5 MHz exactly
++ * (/4, /8). The vendor's 1194 MHz (headroom for HDMI TX compliance tests)
++ * makes every CEA pixel clock non-integer, so the fractional divider
++ * alternates and the VOP clock jitters enough to truncate frames at
++ * 297 MHz (rkcif size err). Kernel 6.1.75 used 1188 MHz as well.
++ */
++#define CPLL_REF_CLK		1188000000
+ 
+ unsigned long rk628_clk_get_rate(struct rk628 *rk628, unsigned int id);
+ int rk628_clk_set_rate(struct rk628 *rk628, unsigned int id,
+diff --git a/drivers/media/i2c/rk628/rk628_csi_v4l2.c b/drivers/media/i2c/rk628/rk628_csi_v4l2.c
+index e4b877eb4..aa645f458 100644
+--- a/drivers/media/i2c/rk628/rk628_csi_v4l2.c
++++ b/drivers/media/i2c/rk628/rk628_csi_v4l2.c
+@@ -101,6 +101,25 @@ struct rk628_csi {
+ 	const char *len_name;
+ 	u32 module_index;
+ 	u8 edid_blocks_written;
++	/*
++	 * Copy of the EDID userspace last applied, so a chip-level re-init
++	 * can restore it (the reset wipes EDID RAM) and so the detection
++	 * fallback can read the preferred DTD.
++	 *
++	 * All blocks, not just block 0: restoring only block 0 drops the CEA
++	 * extension, which takes the HDMI VSDB with it. Without the VSDB the
++	 * EDID reads as single-link DVI and the source prunes every mode
++	 * above 165 MHz, so a re-init would quietly lose 1080p120 and 4K30.
++	 */
++	u8 edid_copy[256];
++	u8 edid_copy_blocks;
++	bool edid_blk0_valid;
++	/* Driver-side wedge watchdog, independent of userspace */
++	struct delayed_work rk628_watchdog_work_d;
++	uint rk628_reinits;
++	uint rk628_i2c_recoveries;
++	int unlock_ticks;
++	bool in_full_reinit;
+ 	u64 lane_mbps;
+ 	u8 csi_lanes_in_use;
+ 	u32 mbus_fmt_code;
+@@ -170,40 +189,57 @@ static const struct v4l2_dv_timings_cap rk628_csi_timings_cap = {
+ 			V4L2_DV_BT_CAP_CUSTOM)
+ };
+ 
++/*
++ * Built-in EDID: 4K30 (VIC 95, 297 MHz) preferred with a 1080p60 fallback
++ * DTD, an HDMI VSDB declaring Max_TMDS 600 MHz, and basic audio. It is
++ * served on every init and watchdog re-init with no userspace dependency.
++ * The CEA extension must survive, or the sink reads as single-link DVI and
++ * the source prunes every mode above 165 MHz.
++ */
+ static u8 edid_init_data[] = {
+ 	0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00,
+-	0x49, 0x73, 0x8D, 0x62, 0x00, 0x88, 0x88, 0x88,
++	/*
++	 * Product id RKS0141. Windows caches EDIDs in the registry keyed by
++	 * PnP id, so changing the EDID content without changing the id
++	 * leaves the stale copy in use. Bump this whenever the bytes change.
++	 */
++	0x49, 0x73, 0x41, 0x01, 0x21, 0x88, 0x88, 0x88,
+ 	0x08, 0x1E, 0x01, 0x03, 0x80, 0x00, 0x00, 0x78,
+ 	0x0A, 0x0D, 0xC9, 0xA0, 0x57, 0x47, 0x98, 0x27,
+ 	0x12, 0x48, 0x4C, 0x00, 0x00, 0x00, 0x01, 0x01,
+ 	0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+-	0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x02, 0x3A,
+-	0x80, 0x18, 0x71, 0x38, 0x2D, 0x40, 0x58, 0x2C,
+-	0x45, 0x00, 0xC4, 0x8E, 0x21, 0x00, 0x00, 0x1E,
+-	0x01, 0x1D, 0x00, 0x72, 0x51, 0xD0, 0x1E, 0x20,
+-	0x6E, 0x28, 0x55, 0x00, 0xC4, 0x8E, 0x21, 0x00,
+-	0x00, 0x1E, 0x00, 0x00, 0x00, 0xFC, 0x00, 0x54,
+-	0x37, 0x34, 0x39, 0x2D, 0x66, 0x48, 0x44, 0x37,
+-	0x32, 0x30, 0x0A, 0x20, 0x00, 0x00, 0x00, 0xFD,
+-	0x00, 0x14, 0x78, 0x01, 0xFF, 0x1D, 0x00, 0x0A,
+-	0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x01, 0x18,
+-
+-	0x02, 0x03, 0x1D, 0x71, 0x47, 0x5F, 0x90, 0x22,
+-	0x04, 0x11, 0x02, 0x01, 0x23, 0x09, 0x07, 0x01,
+-	0x83, 0x01, 0x00, 0x00, 0x65, 0x03, 0x0C, 0x00,
+-	0x10, 0x00, 0xE2, 0x00, 0xCB, 0x02, 0x3A, 0x80,
+-	0x18, 0x71, 0x38, 0x2D, 0x40, 0x58, 0x2C, 0x45,
+-	0x00, 0x20, 0xC2, 0x31, 0x00, 0x00, 0x1E, 0x01,
+-	0x1D, 0x00, 0x72, 0x51, 0xD0, 0x1E, 0x20, 0x6E,
+-	0x28, 0x55, 0x00, 0x20, 0xC2, 0x31, 0x00, 0x00,
+-	0x1E, 0x02, 0x3A, 0x80, 0xD0, 0x72, 0x38, 0x2D,
+-	0x40, 0x10, 0x2C, 0x45, 0x80, 0x20, 0xC2, 0x31,
+-	0x00, 0x00, 0x1E, 0x01, 0x1D, 0x80, 0x18, 0x71,
+-	0x38, 0x2D, 0x40, 0x58, 0x2C, 0x45, 0x00, 0xC0,
+-	0x6C, 0x00, 0x00, 0x00, 0x18, 0x01, 0x1D, 0x80,
+-	0x18, 0x71, 0x1C, 0x16, 0x20, 0x58, 0x2C, 0x25,
+-	0x00, 0xC0, 0x6C, 0x00, 0x00, 0x00, 0x18, 0x00,
+-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11,
++	0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x04, 0x74,
++	0x00, 0x30, 0xF2, 0x70, 0x5A, 0x80, 0xB0, 0x58,
++	0x8A, 0x00, 0xC4, 0x8E, 0x21, 0x00, 0x00, 0x1E,
++	0x02, 0x3A, 0x80, 0x18, 0x71, 0x38, 0x2D, 0x40,
++	0x58, 0x2C, 0x45, 0x00, 0xC4, 0x8E, 0x21, 0x00,
++	0x00, 0x1E, 0x00, 0x00, 0x00, 0xFC, 0x00, 0x57,
++	0x41, 0x52, 0x50, 0x4B, 0x56, 0x4D, 0x20, 0x34,
++	0x4B, 0x0A, 0x20, 0x20, 0x00, 0x00, 0x00, 0xFD,
++	0x00, 0x14, 0x4B, 0x0F, 0x5A, 0x21, 0x00, 0x0A,
++	0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x01, 0x91,
++	/*
++	 * CEA byte 3 bit 6 is "Basic Audio supported". With it clear the
++	 * source is told this sink has no audio and never sends any, so the
++	 * I2S output has nothing to carry. The block 1 checksum below is
++	 * adjusted to match.
++	 */
++	0x02, 0x03, 0x12, 0xC1, 0x42, 0xDF, 0x10, 0x67,
++	0x03, 0x0C, 0x00, 0x10, 0x00, 0x78, 0xE3, 0x0F,
++	0x01, 0x00, 0x04, 0x74, 0x00, 0x30, 0xF2, 0x70,
++	0x5A, 0x80, 0xB0, 0x58, 0x8A, 0x00, 0xC4, 0x8E,
++	0x21, 0x00, 0x00, 0x1E, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF,
+ };
+ 
+ static u8 rk628f_edid_init_data[] = {
+@@ -376,6 +412,25 @@ static const struct rk628_csi_mode supported_modes[] = {
+ 	},
+ };
+ 
++/* Exact CEA VIC 63 (1080p120, 297 MHz). Used when the PHY is powered but
++ * its timing measurement is unreliable and no EDID copy exists to read the
++ * preferred timing from. */
++static struct v4l2_dv_timings src_timing_1080p120 = {
++	.type = V4L2_DV_BT_656_1120,
++	.bt = {
++		.interlaced = V4L2_DV_PROGRESSIVE,
++		.width = 1920,
++		.height = 1080,
++		.hfrontporch = 88,
++		.hsync = 44,
++		.hbackporch = 148,
++		.vfrontporch = 4,
++		.vsync = 5,
++		.vbackporch = 36,
++		.pixelclock = 297000000,
++	},
++};
++
+ static struct v4l2_dv_timings dst_timing = {
+ 	.type = V4L2_DV_BT_656_1120,
+ 	.bt = {
+@@ -479,6 +534,46 @@ static void rk628_hdmirx_ctrl_enable(struct v4l2_subdev *sd, int en)
+ 	}
+ }
+ 
++/* Parse the preferred (first) DTD out of the stored EDID block 0.
++ * Returns true and fills *t on success. */
++static bool rk628_edid_preferred_timing(struct rk628_csi *csi,
++					struct v4l2_dv_timings *t)
++{
++	const u8 *d;
++	u32 pclk10k, hact, hbl, vact, vbl, hfp, hsw, vfp, vsw;
++
++	if (!csi->edid_blk0_valid)
++		return false;
++	d = &csi->edid_copy[54];
++	pclk10k = d[0] | (d[1] << 8);
++	if (pclk10k < 2500) /* not a detailed timing descriptor */
++		return false;
++	hact = d[2] | ((d[4] >> 4) << 8);
++	hbl = d[3] | ((d[4] & 0xf) << 8);
++	vact = d[5] | ((d[7] >> 4) << 8);
++	vbl = d[6] | ((d[7] & 0xf) << 8);
++	hfp = d[8] | (((d[11] >> 6) & 3) << 8);
++	hsw = d[9] | (((d[11] >> 4) & 3) << 8);
++	vfp = (d[10] >> 4) | (((d[11] >> 2) & 3) << 4);
++	vsw = (d[10] & 0xf) | ((d[11] & 3) << 4);
++	if (!hact || !vact || hbl < hfp + hsw || vbl < vfp + vsw)
++		return false;
++
++	memset(t, 0, sizeof(*t));
++	t->type = V4L2_DV_BT_656_1120;
++	t->bt.interlaced = V4L2_DV_PROGRESSIVE;
++	t->bt.width = hact;
++	t->bt.height = vact;
++	t->bt.hfrontporch = hfp;
++	t->bt.hsync = hsw;
++	t->bt.hbackporch = hbl - hfp - hsw;
++	t->bt.vfrontporch = vfp;
++	t->bt.vsync = vsw;
++	t->bt.vbackporch = vbl - vfp - vsw;
++	t->bt.pixelclock = (u64)pclk10k * 10000;
++	return true;
++}
++
+ static int rk628_csi_get_detected_timings(struct v4l2_subdev *sd,
+ 				     struct v4l2_dv_timings *timings)
+ {
+@@ -488,6 +583,27 @@ static int rk628_csi_get_detected_timings(struct v4l2_subdev *sd,
+ 	u32 val, eotf;
+ 
+ 	ret = rk628_hdmirx_get_timings(csi->rk628, timings);
++	if (tx_5v_power_present(sd) && (ret || bt->width < 1280)) {
++		/*
++		 * Detection is unreliable at high TMDS rates, but the EDID
++		 * pins the source to its preferred DTD, so that is the
++		 * answer. Parse it from the EDID we loaded; fall back to a
++		 * static VIC 63 only if no EDID copy exists.
++		 */
++		struct v4l2_dv_timings t;
++
++		if (rk628_edid_preferred_timing(csi, &t)) {
++			v4l2_info(sd, "detection unreliable (ret=%d w=%d), forcing EDID DTD1 %ux%u@%llu\n",
++				  ret, bt->width, t.bt.width, t.bt.height,
++				  (unsigned long long)t.bt.pixelclock);
++			*timings = t;
++		} else {
++			v4l2_info(sd, "detection unreliable (ret=%d w=%d), forcing 1080p120 src\n",
++				  ret, bt->width);
++			*timings = src_timing_1080p120;
++		}
++		ret = 0;
++	}
+ 	if (ret)
+ 		return ret;
+ 
+@@ -514,12 +630,31 @@ static int rk628_csi_get_detected_timings(struct v4l2_subdev *sd,
+ 	else
+ 		csi->mbus_fmt_code = MEDIA_BUS_FMT_RGB888_1X24;
+ 
+-	if ((bt->pixelclock > 300000000 && csi->rk628->version >= RK628F_VERSION) ||
+-		(bt->width > 2048 && csi->rk628->tx_mode == DSI_MODE)) {
+-		v4l2_info(sd, "rk628f detect pixclk more than 300M, use dual mipi mode\n");
++	/*
++	 * Dual MIPI must also require that the board actually routes the
++	 * second CSI port. The vendor driver decides from the pixel clock
++	 * alone, so on F/H silicon any source above 300 MHz flips into
++	 * dual-port output, and on a single-port board capture then never
++	 * completes a frame, which stalls, restreams and eventually wedges
++	 * the bridge.
++	 *
++	 * This is easy to hit: on F/H the driver reports the measured TMDS
++	 * clock as the pixel clock, so a nominal 297 MHz source (1080p120 or
++	 * 4K30) that measures slightly high crosses the threshold. The real
++	 * capability flag is dual_mipi_use, set only when the device tree
++	 * declares multi-dev-info.
++	 */
++	if (((bt->pixelclock > 300000000 && csi->rk628->version >= RK628F_VERSION) ||
++		(bt->width > 2048 && csi->rk628->tx_mode == DSI_MODE)) &&
++		csi->dual_mipi_use) {
++		v4l2_info(sd, "pixclk %llu, dual mipi mode\n", bt->pixelclock);
+ 		csi->rk628->dual_mipi = true;
+ 	} else {
+-		v4l2_info(sd, "pixclk less than 300M, use single mipi mode\n");
++		if (bt->pixelclock > 300000000 && csi->rk628->version >= RK628F_VERSION &&
++		    !csi->dual_mipi_use)
++			v4l2_info(sd,
++				  "pixclk %llu > 300M but board routes ONE CSI port: staying single mipi\n",
++				  bt->pixelclock);
+ 		csi->rk628->dual_mipi = false;
+ 	}
+ 
+@@ -647,6 +782,17 @@ static int rk628_check_resulotion_change(struct v4l2_subdev *sd)
+ 	v4l2_dbg(1, debug, sd, "new mode: %d x %d\n", htotal, vtotal);
+ 	v4l2_dbg(1, debug, sd, "old mode: %d x %d\n", old_htotal, old_vtotal);
+ 
++	/*
++	 * The mode-detect registers return garbage intermittently at high
++	 * TMDS rates. Only trust a plausible reading, otherwise the worker
++	 * resets the PHY forever and never clears nosignal.
++	 */
++	if (htotal < 800 || htotal > 5000 || vtotal < 600 || vtotal > 3000) {
++		v4l2_dbg(1, debug, sd, "implausible mode %dx%d, ignoring\n",
++			 htotal, vtotal);
++		return 0;
++	}
++
+ 	if (htotal != old_htotal || vtotal != old_vtotal)
+ 		return 1;
+ 
+@@ -1003,10 +1149,20 @@ static void enable_stream(struct v4l2_subdev *sd, bool en)
+ 			enable_csitx(sd);
+ 
+ 		rk628_hdmirx_vid_enable(sd, true);
+-		if (csi->rk628->tx_mode == CSI_MODE &&
+-		    csi->rk628->version >= RK628F_VERSION) {
+-			msleep(20);
+-			rk628_mipi_txdata_reset(sd);
++		/*
++		 * Enable the CSITX error interrupts on RK628D too (the vendor
++		 * driver gates them to F) so rk628_csi_error_process
++		 * self-recovery runs. Do not run rk628_mipi_txdata_reset here
++		 * on the D: resetting the TX packer after video enable
++		 * restarts packing at a random point mid-line, and every frame
++		 * comes out shifted by a constant offset. The F needs the
++		 * reset; the D does not.
++		 */
++		if (csi->rk628->tx_mode == CSI_MODE) {
++			if (csi->rk628->version >= RK628F_VERSION) {
++				msleep(20);
++				rk628_mipi_txdata_reset(sd);
++			}
+ 			rk628_csi_enable_csi_interrupts(sd, true);
+ 		}
+ 
+@@ -1465,7 +1621,14 @@ static int rk628_hdmirx_phy_setup(struct v4l2_subdev *sd)
+ 
+ 			if (cnt >= 15)
+ 				break;
+-		} while (((status & 0xfff) < 0xd00) || force_eq ||
++		/*
++		 * Wait for full channel lock (0xf00), as the 6.1.75 driver
++		 * did. The 0xd00 early exit (an RK628F dynamic-EQ change)
++		 * hands a still-settling 297 MHz link to the 0xf00 pass check
++		 * below, which tears it down and power-cycles the PHY forever
++		 * on RK628D.
++		 */
++		} while (((status & 0xfff) < 0xf00) || force_eq ||
+ 				(!rk628_rcv_supported_res(sd, width, height)));
+ 
+ 		if (((status & 0xfff) < 0xf00) ||
+@@ -1503,6 +1666,21 @@ static void rk628_csi_initial(struct v4l2_subdev *sd)
+ 	rk628_i2c_write(csi->rk628, GRF_GPIO0AB_SEL_CON, HIWORD_UPDATE(0x1, 3, 3));
+ 	/* I2SM0D0 */
+ 	rk628_i2c_write(csi->rk628, GRF_GPIO0AB_SEL_CON, HIWORD_UPDATE(0x1, 5, 4));
++	/*
++	 * The three writes above mux only SCLK, LRCK and D0. Rockchip's own
++	 * bare-metal reference muxes the whole I2S group
++	 * (GRF_GPIO0AB_SEL_CON = 0x155c) and also drives a clock out of
++	 * GPIO1_A0 (test_clko).
++	 *
++	 * The difference is invisible on a board that hands I2S to an SoC
++	 * SAI, because the SAI supplies its own clocking. On a board that
++	 * feeds an external I2S DAC straight from the RK628 (the rk628-30p
++	 * feeds a GC4344), the DAC derives its sample rate from the master
++	 * clock, so without it the data is valid and the output is silent.
++	 */
++	rk628_i2c_write(csi->rk628, GRF_GPIO0AB_SEL_CON, 0x155c155c);
++	rk628_i2c_write(csi->rk628, GRF_GPIO1AB_SEL_CON, HIWORD_UPDATE(0x1, 0, 0));
++	rk628_clk_mux_testout(csi->rk628, CGU_CLK_HDMIRX_AUD);
+ 	/* hdmirx int en */
+ 	if (csi->rk628->version >= RK628F_VERSION)
+ 		rk628_i2c_write(csi->rk628, GRF_INTR0_EN, 0x02000200);
+@@ -2242,7 +2420,15 @@ static int rk628_csi_enum_frame_interval(struct v4l2_subdev *sd,
+ static u32 rk628_csi_get_lane_rate_mbps(struct rk628_csi *csi)
+ {
+ 	u32 lane_rate;
+-	u32 max_lane_rate = 1800;
++	/*
++	 * 1800 does not lock on RK628D, but that is a D erratum, not a board
++	 * limit: F/H drive it fine, and the RK3576 D-PHY accepts up to
++	 * 2499 Mbps per lane. Clamping every part to 1500 starved 1080p165
++	 * and 1080p180 (1633 and 1782 Mbps): the receiver locked, the
++	 * transmitter ran too slow to carry the mode, and capture never
++	 * completed a frame.
++	 */
++	u32 max_lane_rate = csi->rk628->version < RK628F_VERSION ? 1500 : 1800;
+ 	u8 bpp, lanes;
+ 	u64 pixelclock = csi->timings.bt.pixelclock;
+ 
+@@ -2260,6 +2446,12 @@ static u32 rk628_csi_get_lane_rate_mbps(struct rk628_csi *csi)
+ 		lane_rate = max_lane_rate;
+ 	else if (lane_rate > 1300 && lane_rate <= 1500)
+ 		lane_rate = 1500;
++	/*
++	 * 1188 Mbps (1080p120 and 4K30) lands here. 1300 is the operating
++	 * point the 6.1.75 kernel proved out; the truncated frames that once
++	 * pointed at this bucket came from the D-PHY configuration order,
++	 * fixed in mipi_dphy_power_on().
++	 */
+ 	else if (lane_rate > 900 && lane_rate <= 1300)
+ 		lane_rate = 1300;
+ 	else if (lane_rate > 700 && lane_rate <= 900)
+@@ -2470,9 +2662,21 @@ static int rk628_csi_s_edid(struct v4l2_subdev *sd,
+ 
+ 	if (edid->blocks == 0) {
+ 		csi->edid_blocks_written = 0;
++		csi->edid_blk0_valid = false;
+ 		return 0;
+ 	}
+ 
++	/*
++	 * Keep every block so a chip-level re-init restores the EDID exactly
++	 * as userspace wrote it. Keeping only block 0 drops the CEA extension
++	 * and with it the HDMI VSDB, which downgrades the sink to single-link
++	 * DVI and prunes every mode above 165 MHz.
++	 */
++	csi->edid_copy_blocks = min_t(u8, edid->blocks, 2);
++	memcpy(csi->edid_copy, edid->edid,
++	       csi->edid_copy_blocks * EDID_BLOCK_SIZE);
++	csi->edid_blk0_valid = true;
++
+ 	/* edid access by apb when write, i2c slave addr: 0x0 */
+ 	rk628_i2c_update_bits(csi->rk628, GRF_SYSTEM_CON0,
+ 			SW_ADAPTER_I2CSLADR_MASK |
+@@ -2510,6 +2714,31 @@ static int rk628_csi_s_edid(struct v4l2_subdev *sd,
+ 	return 0;
+ }
+ 
++/*
++ * VIDIOC_S_EDID entry point.
++ *
++ * rk628_csi_s_edid() drops HPD before writing the EDID and only raises it
++ * again on pre-F silicon; on F/H the vendor driver leaves it low and relies
++ * on an internal caller to schedule the hotplug work afterwards. A
++ * userspace S_EDID has no such caller, so on F/H the source sees HPD go low
++ * and never come back: the display vanishes and the new EDID is never
++ * read. Run the full plug-in sequence (controller setup and HPD assert) so
++ * the source re-reads the EDID just written.
++ */
++static int rk628_csi_s_edid_ioctl(struct v4l2_subdev *sd,
++				  struct v4l2_subdev_edid *edid)
++{
++	struct rk628_csi *csi = to_csi(sd);
++	int ret = rk628_csi_s_edid(sd, edid);
++
++	if (!ret && edid->blocks && csi->rk628->version >= RK628F_VERSION &&
++	    tx_5v_power_present(sd))
++		mod_delayed_work(system_wq, &csi->delayed_work_enable_hotplug,
++				 msecs_to_jiffies(100));
++
++	return ret;
++}
++
+ static void rk628_reset_edid(struct v4l2_subdev *sd, u8 *edid_data, u8 edid_version)
+ {
+ 	struct rk628_csi *csi = to_csi(sd);
+@@ -2770,15 +2999,22 @@ static int mipi_dphy_power_on(struct rk628_csi *csi)
+ 		bus_width |= COMBTXPHY_MODULEB_EN;
+ 	v4l2_info(sd, "%s mipi bitrate:%llu mbps\n", __func__, csi->lane_mbps);
+ 
+-	rk628_mipi_dphy_reset_assert(csi->rk628);
+-	rk628_mipi_dphy_reset_deassert(csi->rk628);
+-
+ 	rk628_txphy_set_bus_width(csi->rk628, bus_width);
+ 	rk628_txphy_set_mode(csi->rk628, PHY_MODE_VIDEO_MIPI);
+ 
++	/*
++	 * Program the D-PHY test registers (hsfreqrange and manual HS
++	 * timing) while the PHY is held in reset, then release reset to
++	 * latch them, the order the 6.1.75 driver used. Writing them after
++	 * deassert leaves the PLL on defaults at 1100 Mbps and above: the
++	 * link locks but drops sync mid-frame (rkcif size err).
++	 */
++	rk628_mipi_dphy_reset_assert(csi->rk628);
+ 	rk628_mipi_dphy_init_hsfreqrange(csi->rk628, csi->lane_mbps, 0);
+ 	if (csi->rk628->version >= RK628F_VERSION && csi->rk628->enable_csi1)
+ 		rk628_mipi_dphy_init_hsfreqrange(csi->rk628, csi->lane_mbps, 1);
++	rk628_mipi_dphy_reset_deassert(csi->rk628);
++	usleep_range(1500, 2000);
+ 
+ 	rk628_txphy_power_on(csi->rk628);
+ 
+@@ -3115,7 +3351,7 @@ static const struct v4l2_subdev_pad_ops rk628_csi_pad_ops = {
+ 	.set_fmt = rk628_csi_set_fmt,
+ 	.get_fmt = rk628_csi_get_fmt,
+ 	.get_edid = rk628_csi_g_edid,
+-	.set_edid = rk628_csi_s_edid,
++	.set_edid = rk628_csi_s_edid_ioctl,
+ 	.enum_dv_timings = rk628_csi_enum_dv_timings,
+ 	.dv_timings_cap = rk628_csi_dv_timings_cap,
+ 	.get_mbus_config = rk628_csi_g_mbus_config,
+@@ -3234,6 +3470,177 @@ static int rk628_csi_power_on(struct rk628_csi *csi)
+ 	return 0;
+ }
+ 
++/*
++ * Full chip recovery, modeled on the resume path: hardware reset via the
++ * reset GPIO, then CRU, clock and controller re-init, and the EDID
++ * restored from the stored copy (the chip reset wipes EDID RAM).
++ */
++static void rk628_full_reinit(struct v4l2_subdev *sd)
++{
++	struct rk628_csi *csi = to_csi(sd);
++
++	/*
++	 * Snapshot the EDID before re-init. rk628_csi_initial() applies the
++	 * driver's built-in default through s_edid, which overwrites the
++	 * saved copy, so restoring from it afterwards would re-apply the
++	 * default and discard whatever EDID userspace had set.
++	 */
++	u8 saved[sizeof(csi->edid_copy)];
++	u8 saved_blocks = csi->edid_copy_blocks;
++	bool saved_valid = csi->edid_blk0_valid;
++
++	if (saved_valid)
++		memcpy(saved, csi->edid_copy, sizeof(saved));
++
++	disable_irq(csi->plugin_irq);
++	disable_irq(csi->hdmirx_irq);
++	rk628_csi_power_on(csi);
++	rk628_cru_initialize(csi->rk628);
++	rk628_clk_set_rate(csi->rk628, CGU_CLK_CPLL, CPLL_REF_CLK);
++	rk628_csi_initial(sd);
++	if (saved_valid) {
++		struct v4l2_subdev_edid e = {
++			.pad = 0,
++			.start_block = 0,
++			.blocks = saved_blocks,
++			.edid = saved,
++		};
++		rk628_csi_s_edid(sd, &e);
++	}
++	enable_irq(csi->plugin_irq);
++	enable_irq(csi->hdmirx_irq);
++}
++
++/*
++ * Watchdog: recovers the chip-level wedge in which the mode-detect clock
++ * reads about 4.1x high, the PHY never locks, and HPD control stops taking
++ * effect. Without it only a physical replug cures the wedge.
++ *
++ * It must not trigger on "5V present and unlocked" alone. That is the
++ * ordinary idle state (source asleep, powered off, or not driving video),
++ * and on these boards tx_5v_power_present() can read true with no cable
++ * attached, so a naive watchdog re-initialises the chip every few seconds,
++ * and each re-init is a burst of blocking I2C. So:
++ *
++ *   - it can be turned off (rk628_watchdog=0);
++ *   - it requires the wedge signature (implausible mode-detect totals),
++ *     not merely an unlocked PHY, so an idle input is left alone;
++ *   - attempts are capped with backoff, so it can never loop.
++ */
++static uint rk628_watchdog = 1;
++module_param(rk628_watchdog, uint, 0644);
++static uint rk628_watchdog_max = 3;
++module_param(rk628_watchdog_max, uint, 0644);
++/*
++ * Consecutive I2C failures before the bridge is treated as off the bus and
++ * recovered through the reset GPIO. High enough that a transient NAK never
++ * trips it; low enough that a wedged chip is caught within one tick.
++ */
++static uint rk628_i2c_err_max = 20;
++module_param(rk628_i2c_err_max, uint, 0644);
++
++static int rk628_csi_power_off(struct rk628_csi *csi);
++
++static void rk628_watchdog_work(struct work_struct *work)
++{
++	struct rk628_csi *csi = container_of(to_delayed_work(work),
++					     struct rk628_csi, rk628_watchdog_work_d);
++	struct v4l2_subdev *sd = &csi->sd;
++	u32 status = 0, htotal = 0, vtotal = 0;
++	bool wedged;
++
++	if (!rk628_watchdog || csi->in_full_reinit)
++		goto again;
++
++	/*
++	 * Bus-level recovery, checked before anything that needs I2C.
++	 *
++	 * The bridge can drop off the I2C bus completely, every access
++	 * returning -ETIMEDOUT; replugging HDMI on a powered board does it.
++	 * Once it happens nothing downstream works: EDID cannot be served, so
++	 * the source falls back or loses the display, and the check below is
++	 * blind because its own reads fail.
++	 *
++	 * Only a reset-GPIO cycle recovers it, and that path touches no I2C,
++	 * which is why it works here. The vendor driver has no equivalent:
++	 * reset and enable are sequenced once at probe and never again.
++	 */
++	if (atomic_read(&csi->rk628->i2c_errors) >= rk628_i2c_err_max) {
++		if (csi->rk628_i2c_recoveries >= rk628_watchdog_max) {
++			v4l2_err(sd, "i2c wedged, recovery limit reached; giving up\n");
++			goto again;
++		}
++		csi->rk628_i2c_recoveries++;
++		v4l2_err(sd, "i2c wedged (%d consecutive errors), reset-GPIO recovery %u/%u\n",
++			 atomic_read(&csi->rk628->i2c_errors),
++			 csi->rk628_i2c_recoveries, rk628_watchdog_max);
++
++		csi->in_full_reinit = true;
++		rk628_csi_power_off(csi);
++		usleep_range(20000, 21000);
++		rk628_csi_power_on(csi);
++		atomic_set(&csi->rk628->i2c_errors, 0);
++		csi->in_full_reinit = false;
++
++		/* The chip came up blank: re-run the full init, which restores
++		 * the EDID from the stored copy and re-asserts HPD.
++		 */
++		rk628_full_reinit(sd);
++		csi->unlock_ticks = 0;
++		goto again;
++	}
++
++	if (csi->rk628_reinits >= rk628_watchdog_max)
++		goto again; /* gave up; a real replug path will reset this */
++	if (!tx_5v_power_present(sd)) {
++		csi->unlock_ticks = 0;
++		goto again;
++	}
++
++	rk628_i2c_read(csi->rk628, HDMI_RX_SCDC_REGS1, &status);
++	if ((status & 0xfff) >= 0xf00) {
++		csi->unlock_ticks = 0;   /* locked: healthy */
++		csi->rk628_reinits = 0;
++		goto again;
++	}
++
++	/*
++	 * Unlocked is not enough. Read the mode-detect totals: a wedged chip
++	 * reports implausible geometry (the 4.1x clock signature), while a
++	 * merely idle input reports zeros. Only the former is repairable by
++	 * a reset, and only the former is worth the cost of one.
++	 */
++	rk628_i2c_read(csi->rk628, HDMI_RX_MD_HT1, &htotal);
++	htotal = (htotal >> 16) & 0xffff;
++	rk628_i2c_read(csi->rk628, HDMI_RX_MD_VTL, &vtotal);
++	vtotal &= 0xffff;
++	wedged = (htotal > 5000 || vtotal > 3000) ||
++		 (htotal && vtotal && (htotal < 500 || vtotal < 400));
++	if (!wedged) {
++		csi->unlock_ticks = 0;   /* idle, not wedged: leave it alone */
++		goto again;
++	}
++
++	if (++csi->unlock_ticks >= 5) {
++		csi->unlock_ticks = 0;
++		csi->rk628_reinits++;
++		v4l2_err(sd, "watchdog: wedged (mode %ux%u), chip re-init %u/%u\n",
++			 htotal, vtotal, csi->rk628_reinits, rk628_watchdog_max);
++		mutex_lock(&csi->confctl_mutex);
++		csi->in_full_reinit = true;
++		rk628_full_reinit(sd);
++		csi->in_full_reinit = false;
++		mutex_unlock(&csi->confctl_mutex);
++		schedule_delayed_work(&csi->delayed_work_enable_hotplug,
++				      msecs_to_jiffies(500));
++	}
++again:
++	/* Back off hard once attempts have been spent. */
++	schedule_delayed_work(&csi->rk628_watchdog_work_d,
++			      msecs_to_jiffies(csi->rk628_reinits >= rk628_watchdog_max
++					       ? 30000 : 2000));
++}
++
+ static int rk628_csi_power_off(struct rk628_csi *csi)
+ {
+ 	if (csi->enable_gpio) {
+@@ -3400,8 +3807,12 @@ static int rk628_csi_probe_of(struct rk628_csi *csi)
+ 	if (of_property_read_bool(dev->of_node, "scaler-en"))
+ 		scaler_en = true;
+ 
+-	if (of_property_read_bool(dev->of_node, "continues-clk"))
+-		continues_clk = true;
++	/*
++	 * Continuous clock is required above 60 Hz (without it rkcif reports
++	 * "size err" at 1080p120 and up) and works at every lower rate, so it
++	 * is the default. Boards that need gated clock can say so in the DT.
++	 */
++	continues_clk = !of_property_read_bool(dev->of_node, "non-continuous-clk");
+ 
+ 	ep = of_graph_get_next_endpoint(dev->of_node, NULL);
+ 	if (!ep) {
+@@ -3818,6 +4229,9 @@ static int rk628_csi_probe(struct i2c_client *client,
+ 			rk628_csi_delayed_work_enable_hotplug);
+ 	INIT_DELAYED_WORK(&csi->delayed_work_res_change,
+ 			rk628_delayed_work_res_change);
++	/* Arm the wedge watchdog (first check after 10 s). */
++	INIT_DELAYED_WORK(&csi->rk628_watchdog_work_d, rk628_watchdog_work);
++	schedule_delayed_work(&csi->rk628_watchdog_work_d, msecs_to_jiffies(10000));
+ 	csi->audio_info = rk628_hdmirx_audioinfo_alloc(dev,
+ 						       &csi->confctl_mutex,
+ 						       rk628,
+diff --git a/drivers/media/i2c/rk628/rk628_hdmirx.c b/drivers/media/i2c/rk628/rk628_hdmirx.c
+index dd4e06c98..64b64881d 100644
+--- a/drivers/media/i2c/rk628/rk628_hdmirx.c
++++ b/drivers/media/i2c/rk628/rk628_hdmirx.c
+@@ -1874,6 +1874,24 @@ static int rk628_hdmirx_read_timing(struct rk628 *rk628,
+ 			HDMIRX_MODETCLK_CNT_NUM;
+ 		vs = (vs + htotal / 2) / htotal;
+ 
++		/*
++		 * The PHY mis-measures the sync widths at high TMDS rates
++		 * (297 MHz: hs 183 instead of 44, vs 20 instead of 5) while
++		 * totals, actives, hofs_pix and vbp stay exact. Restore the
++		 * CEA-861 sync widths when the surrounding geometry is
++		 * unambiguously CEA 1080p (htotal 2200, vtotal 1125, shared
++		 * by VIC 16 and VIC 63) instead of rejecting a locked signal.
++		 */
++		if (hact == 1920 && vact == 1080 &&
++		    htotal == 2200 && vtotal == 1125 &&
++		    (vtotal < (vact + vs + vbp) || hofs_pix < hs)) {
++			dev_info(rk628->dev,
++				 "sync width out of range (hs:%d vs:%d), using CEA 1080p (44/5)\n",
++				 hs, vs);
++			hs = 44;
++			vs = 5;
++		}
++
+ 		if ((hofs_pix < hs) || (htotal < (hact + hofs_pix)) ||
+ 				(vtotal < (vact + vs + vbp)) || !vs) {
+ 			dev_err(rk628->dev, "timing err, total:%dx%d, act:%dx%d, hofs:%d, hs:%d, vs:%d, vbp:%d\n",
+diff --git a/drivers/media/i2c/rk628/rk628_mipi_dphy.c b/drivers/media/i2c/rk628/rk628_mipi_dphy.c
+index 38809ef50..c00954b4e 100644
+--- a/drivers/media/i2c/rk628/rk628_mipi_dphy.c
++++ b/drivers/media/i2c/rk628/rk628_mipi_dphy.c
+@@ -7,6 +7,7 @@
+ #include <linux/module.h>
+ #include <linux/i2c.h>
+ #include <linux/regmap.h>
++#include <linux/delay.h>
+ 
+ #include "rk628_csi.h"
+ #include "rk628_dsi.h"
+@@ -111,6 +112,8 @@ static void rk628_testif_set_timing(struct rk628 *rk628, u8 addr,
+ 		return;
+ 
+ 	rk628_testif_write(rk628, addr, (max + 1) | val, mipi_id);
++	/* Settle between HS timing writes, as the 6.1.75 driver did. */
++	usleep_range(1500, 2000);
+ }
+ 
+ u8 rk628_testif_read(struct rk628 *rk628, u8 test_code, uint8_t mipi_id)
+@@ -212,7 +215,9 @@ static void rk628_mipi_dphy_set_timing(struct rk628 *rk628, int lane_mbps, uint8
+ 
+ 	for (index = 0; index < ARRAY_SIZE(timing_table); index++)
+ 		if (lane_mbps >= timing_table[index].min_lane_mbps &&
+-		    lane_mbps < timing_table[index].max_lane_mbps)
++		    /* Inclusive bound: 1500 must match its own {1450, 1500}
++		     * row, not fall through to {1750, 2050}. */
++		    lane_mbps <= timing_table[index].max_lane_mbps)
+ 			break;
+ 
+ 	if (index == ARRAY_SIZE(timing_table))
+@@ -259,6 +264,20 @@ void rk628_mipi_dphy_init_hsfreqrange(struct rk628 *rk628, int lane_mbps, uint8_
+ 	hsfreqrange = hsfreqrange_table[index].hsfreqrange;
+ 	rk628_testif_write(rk628, 0x44, HSFREQRANGE(hsfreqrange), mipi_id);
+ 	rk628_mipi_dphy_set_timing(rk628, lane_mbps, mipi_id);
++	/* Verify the test registers latched */
++	dev_info(rk628->dev,
++		 "dphy%d readback 0x44=%02x 60=%02x 61=%02x 62=%02x 63=%02x 65=%02x 70=%02x 71=%02x 72=%02x 73=%02x\n",
++		 mipi_id,
++		 rk628_testif_read(rk628, 0x44, mipi_id),
++		 rk628_testif_read(rk628, 0x60, mipi_id),
++		 rk628_testif_read(rk628, 0x61, mipi_id),
++		 rk628_testif_read(rk628, 0x62, mipi_id),
++		 rk628_testif_read(rk628, 0x63, mipi_id),
++		 rk628_testif_read(rk628, 0x65, mipi_id),
++		 rk628_testif_read(rk628, 0x70, mipi_id),
++		 rk628_testif_read(rk628, 0x71, mipi_id),
++		 rk628_testif_read(rk628, 0x72, mipi_id),
++		 rk628_testif_read(rk628, 0x73, mipi_id));
+ }
+ EXPORT_SYMBOL(rk628_mipi_dphy_init_hsfreqrange);
+ 

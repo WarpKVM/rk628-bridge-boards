@@ -1,0 +1,24 @@
+rk628: build on Luckfox's RV1126B kernel (6.1.141)
+
+Apply after copying the patched driver (Rockchip develop-6.1 plus
+0001-rk628h-fixes.patch) into drivers/media/i2c/rk628/ of Luckfox's tree.
+That tree's rkcif has no external fence, so the call that signals one is
+dropped. Nothing on that rkcif waits for it.
+
+Modified by Ground Plane Studio, LLC, 2026. GPL-2.0.
+
+--- a/drivers/media/i2c/rk628/rk628_csi_v4l2.c	2026-11-12 11:54:56.932065770 -0800
++++ b/drivers/media/i2c/rk628/rk628_csi_v4l2.c	2026-11-12 11:54:56.934355969 -0800
+@@ -1827,7 +1827,11 @@
+ 
+ 	rk628_get_remote_dev(&sd->entity, &vdev);
+ 	if (vdev != NULL) {
+-		rkcif_external_fence_signal(vdev);
++		/*
++		 * Older rkcif drivers (Luckfox's 6.1.141 RV1126B tree) have no
++		 * external fence, and nothing waits on one, so there is nothing
++		 * to signal here.
++		 */
+ 		v4l2_dbg(1, debug, sd, "%s, signal fence\n", __func__);
+ 	} else {
+ 		v4l2_dbg(1, debug, sd, "%s, signal fence failed\n", __func__);

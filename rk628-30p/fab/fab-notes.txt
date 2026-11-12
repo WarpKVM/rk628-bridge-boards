@@ -1,0 +1,71 @@
+RK628H 22P Board RevA - Board Fabrication Info
+==============================================
+
+Board size (design)      : 30 mm x 46.25 mm
+
+Material and stackup
+--------------------
+Base material            : FR-4
+Material type            : TG155
+Layers                   : 4
+PCB thickness (typical)  : 1.6 mm
+Outer copper weight      : 1 oz
+Inner copper weight      : 1 oz
+
+Stackup (finished thickness 1.54 mm +/-10%) (JLC041611-3313)
+----------------------------------------------------------
+Layer    Material                        Thickness (mil)   Thickness (mm)
+L1       Outer copper 1 oz               1.38              0.0350
+Prepreg  3313 RC57% 4.2 mil              3.62              0.0920
+L2       Inner copper 1 oz               1.18              0.0300
+Core     1.3 mm 1/1 oz with copper       48.43             1.2300
+L3       Inner copper 1 oz               1.18              0.0300
+Prepreg  3313 RC57% 4.2 mil              3.62              0.0920
+L4       Outer copper 1 oz               1.38              0.0350
+
+Impedance (Signal on L1, reference L2)
+------------------------------------------------------
+Impedance  Type                           Trace width   Trace spacing   Trace to copper
+100 ohm    Coplanar differential pair     0.1130 mm     0.2032 mm       0.2032 mm
+
+Vias and holes
+--------------
+Min via hole/diameter    : 0.2 mm / 0.33 mm
+Via covering             : Epoxy filled & capped
+Via plating method       : Horizontal electroless copper plating
+
+Finish and markings
+-------------------
+Surface finish           : ENIG, gold thickness 1 u"
+PCB color (solder mask)  : Black
+Silkscreen               : White
+Silkscreen technology    : Ink-jet printing silkscreen
+Mark on PCB              : Remove mark
+Board outline tolerance  : +/-0.2 mm (regular)
+
+Test and quality
+----------------
+Electrical test          : Flying probe, fully tested
+4-wire Kelvin test       : Yes
+Appearance quality       : IPC Class 2 standard
+
+Drills
+------
+#  Type  Count  Metric (mm)  Imperial (mil)
+1  PTH       4     2.700         106
+2  NPTH      2     1.400          55
+3  VIA      29     0.350          14
+4  VIA     129     0.300          12
+5  VIA      57     0.250          10
+6  VIA      67     0.200           8
+
+Totals
+------
+PTH holes  :   4
+NPTH holes :   2
+Vias       : 282
+All holes  : 288
+
+Smallest drill : 0.200 mm (8 mil)
+
+

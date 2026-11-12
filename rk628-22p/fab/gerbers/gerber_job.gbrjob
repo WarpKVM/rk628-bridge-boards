@@ -1,0 +1,24 @@
+{
+    "Header": {
+        "Comment": "All values are metric (mm)",
+        "CreationDate": "2026-11-12T14:36:04Z",
+        "GenerationSoftware": {
+            "Application": "Fusion Electronics",
+            "Vendor": "Autodesk",
+            "Version": "9.7.0"
+        },
+        "Part": "Single"
+    },
+    "Overall": {
+        "BoardThickness": 1.6348,
+        "LayerNumber": 4,
+        "Name": {
+            "ProjectId": "RK628H 22P Board RevA"
+        },
+        "Owner": "Ground Plane Studio, LLC",
+        "Size": {
+            "X": 30,
+            "Y": 45
+        }
+    }
+}

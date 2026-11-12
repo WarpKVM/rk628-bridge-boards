@@ -1,0 +1,335 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Portions follow Rockchip's rv1126b-evb-ext-rk628-hdmi2csi.dtsi:
+ * Copyright (c) 2025 Rockchip Electronics Co., Ltd.
+ * Modified by Ground Plane Studio, LLC, 2026.
+ *
+ * RK628H HDMI to MIPI CSI bridge on a Luckfox Aura, dual link.
+ *
+ * Used as is by rv1126b-luckfox-aura-rk628h-dual.dts (rk628-2x22p, 4K60), and
+ * minus the multi-dev-info node by rv1126b-luckfox-aura-rk628h-single.dts
+ * (rk628-22p, one link).
+ *
+ * Above a 300 MHz pixel clock the RK628H splits each frame left and right
+ * across both of its MIPI TX ports. Rockchip's own RK628 dual references
+ * (rk3576 / rk3588 -rk628-hdmi2csi) land both links on one combo D-PHY (two
+ * virtual hosts inside it), and the rk628-csi driver parses only one
+ * endpoint. Here the two links go to two physically separate Aura receivers
+ * over two 22-pin FPCs:
+ *
+ *   RK628 CSI1 (TX5-9), first FPC (carries I2C, INTN, RSTN)
+ *       -> Aura CSI0 (rx0): csi2_dphy0 -> mipi0_csi2 -> rkcif_mipi_lvds
+ *   RK628 CSI0 (TX0-4), second FPC (lanes only)
+ *       -> Aura CSI1 (rx1): csi2_dphy3 -> mipi2_csi2 -> rkcif_mipi_lvds2
+ *
+ * The rkcif combine (RKMODULE_MULTI_DEV_COMBINE_ONE) is host indexed
+ * (rkcif_write_buff_addr_multi_dev_combine loops over dev_idx[]), so it spans
+ * two separate receivers, not just two virtual hosts of one combo D-PHY. This
+ * topology captured 4K60 on an earlier board with the same wiring.
+ *
+ * Tuning notes:
+ *   - dev-idx-l/-r: the RV1126B rkcif remaps these (capture.c: 0->2, 2->4,
+ *     3->5). If the seam is mirrored, swap l and r.
+ *   - combine-idx: the host the combined frame surfaces on (the capture node).
+ */
+
+&i2c4 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&i2c4m2_pins>;
+	clock-frequency = <400000>;
+
+	rk628_csi: rk628_csi@50 {
+		reg = <0x50>;
+		compatible = "rockchip,rk628-csi-v4l2";
+		status = "okay";
+		#sound-dai-cells = <0>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&rk628_hdmiin_pin>;
+
+		/* INTN on GPIO4_A0, RSTN on GPIO4_B0. Same as single-link. */
+		interrupt-parent = <&gpio4>;
+		interrupts = <RK_PA0 IRQ_TYPE_LEVEL_HIGH>;
+		reset-gpios = <&gpio4 RK_PB0 GPIO_ACTIVE_LOW>;
+
+		/* Required above 60 Hz; harmless below. */
+		continues-clk = <1>;
+
+		/*
+		 * Unmute the RK628 I2S data output by default. The driver only
+		 * unmutes AUD_SAO_CTRL on a sample-flat change, gated on
+		 * aif->i2s_enabled; here that gate stays false, so a source that is
+		 * non-flat from the first read never triggers the write, the I2S
+		 * data stays muted (0x30260 bits 8:5 = 0xf) and the SAI captures
+		 * silence. This flag makes rk628_hdmirx_audio_setup unmute at setup,
+		 * the driver path meant for boards that feed an SoC SAI.
+		 */
+		i2s-enable-default;
+
+		rockchip,camera-module-index = <0>;
+		rockchip,camera-module-facing = "back";
+		rockchip,camera-module-name = "HDMI-MIPI";
+		rockchip,camera-module-lens-name = "RK628-CSI";
+
+		/*
+		 * The switch that enables dual MIPI. Presence of this node sets
+		 * dual_mipi_use in the driver, which (a) advertises the 4K EDID and
+		 * (b) lets a source above 300 MHz flip to the split output.
+		 *
+		 *   dev-idx-l = left  half = RK628 CSI0/TX0-4 -> second FPC -> Aura CSI1 (lvds2)
+		 *   dev-idx-r = right half = RK628 CSI1/TX5-9 -> first FPC  -> Aura CSI0 (lvds)
+		 */
+		multi-dev-info {
+			dev-idx-l = <2>;
+			dev-idx-r = <0>;
+			combine-idx = <0>;
+			pixel-offset = <0>;
+			dev-num = <2>;
+		};
+
+		/*
+		 * One graph endpoint, like every Rockchip RK628 reference. A second
+		 * port (port@1 -> dphy3) hangs the boot: the rk628 driver registers
+		 * a single media pad, so a remote pointing at port 1 indexes a pad
+		 * that does not exist. The second receiver (dphy3) is enabled below
+		 * with no graph source; the rkcif combine addresses it by host index,
+		 * not by media link.
+		 */
+		port {
+			hdmiin_out: endpoint {
+				remote-endpoint = <&hdmi_mipi_in>;
+				data-lanes = <1 2 3 4>;
+			};
+		};
+	};
+};
+
+/*
+ * ramoops: serial-free crash visibility. CONFIG_PSTORE_RAM/CONSOLE are built in
+ * but no board dts places a region. If this DTB hangs the boot, the console log
+ * up to the hang lands here and shows up under /sys/fs/pstore/ on the next
+ * boot (survives a warm reset; usually survives a quick power cycle).
+ * System RAM on RV1126B is 0x40200000-0x7fffffff (NOT base 0: the Rockchip
+ * ramoops@110000 convention would be outside RAM here). 0x50000000 sits in the
+ * free mid-RAM gap, clear of the kernel, CMA, drm-logo and U-Boot staging.
+ * reserved_memory in rv1126b.dtsi is 1-cell address/size.
+ */
+&reserved_memory {
+	ramoops: ramoops@50000000 {
+		compatible = "ramoops";
+		reg = <0x50000000 0xf0000>;
+		record-size = <0x20000>;
+		console-size = <0x80000>;
+		ftrace-size = <0x0>;
+		pmsg-size = <0x50000>;
+	};
+};
+
+/* Both split D-PHY hardware blocks. */
+&csi2_dphy0_hw {
+	status = "okay";
+};
+
+&csi2_dphy1_hw {
+	status = "okay";
+};
+
+/* Link 1: Aura CSI0 (rx0), carries the RK628 control sideband on i2c4. */
+&csi2_dphy0 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			hdmi_mipi_in: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&hdmiin_out>;
+				data-lanes = <1 2 3 4>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			csidphy0_out: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&mipi0_csi2_input>;
+			};
+		};
+	};
+};
+
+&mipi0_csi2 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			mipi0_csi2_input: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&csidphy0_out>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			mipi0_csi2_output: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&cif_mipi_in>;
+			};
+		};
+	};
+};
+
+&rkcif_mipi_lvds {
+	status = "okay";
+
+	port {
+		cif_mipi_in: endpoint {
+			remote-endpoint = <&mipi0_csi2_output>;
+		};
+	};
+};
+
+/*
+ * Link 2: Aura CSI1 (rx1), the second half. Modeled on cam-csi1.dtsi but
+ * stopping at rkcif (no sditf / rkisp / rkvpss), as link 1 does: HDMI is
+ * already YUV422 and the combine is a pure CIF to memory capture.
+ */
+&csi2_dphy3 {
+	status = "okay";
+
+	/*
+	 * No port@0 (no graph source). The RK628 exposes a single endpoint and
+	 * dphy0 holds it. The combine reaches this receiver by host index.
+	 */
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@1 {
+			reg = <1>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			csidphy3_out: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&mipi2_csi2_input>;
+			};
+		};
+	};
+};
+
+&mipi2_csi2 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			mipi2_csi2_input: endpoint@1 {
+				reg = <1>;
+				remote-endpoint = <&csidphy3_out>;
+			};
+		};
+
+		port@1 {
+			reg = <1>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			mipi2_csi2_output: endpoint@0 {
+				reg = <0>;
+				remote-endpoint = <&cif_mipi_in2>;
+			};
+		};
+	};
+};
+
+&rkcif_mipi_lvds2 {
+	status = "okay";
+
+	port {
+		cif_mipi_in2: endpoint {
+			remote-endpoint = <&mipi2_csi2_output>;
+		};
+	};
+};
+
+&rkcif {
+	status = "okay";
+};
+
+&rkcif_mmu {
+	status = "okay";
+};
+
+/* INTN GPIO4_A0 and RSTN GPIO4_B0, the CSI0 FPC's IO0 and IO1 lines. */
+&pinctrl {
+	hdmiin {
+		rk628_hdmiin_pin: rk628-hdmiin-pin {
+			rockchip,pins =
+				<4 RK_PA0 RK_FUNC_GPIO &pcfg_pull_none>,
+				<4 RK_PB0 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+	};
+};
+
+/*
+ * HDMI-in audio: RK628 I2S -> SAI1 (M2 mux), three wires from the bridge's
+ * I2S header to the Aura's 40-pin header (pins 12, 16, 18). The bridge is the
+ * I2S master.
+ */
+/ {
+	rk628_dc: rk628-dc {
+		compatible = "rockchip,dummy-codec";
+		#sound-dai-cells = <0>;
+	};
+
+	hdmiin-sound {
+		compatible = "simple-audio-card";
+		simple-audio-card,format = "i2s";
+		simple-audio-card,name = "rockchip,hdmiin";
+		simple-audio-card,bitclock-master = <&dailink0_master>;
+		simple-audio-card,frame-master = <&dailink0_master>;
+		status = "okay";
+
+		simple-audio-card,cpu {
+			sound-dai = <&sai1>;
+		};
+
+		dailink0_master: simple-audio-card,codec {
+			sound-dai = <&rk628_dc>;
+		};
+	};
+};
+
+&sai1 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&sai1m2_sclk_pins
+		     &sai1m2_lrck_pins
+		     &sai1m2_sdi_pins>;
+};

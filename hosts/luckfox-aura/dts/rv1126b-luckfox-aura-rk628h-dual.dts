@@ -1,0 +1,234 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+/*
+ * Copyright (c) 2025 Rockchip Electronics Co., Ltd.
+ *   (the board content below the include block, copied from
+ *   rv1126b-luckfox-aura.dts, which carries this line)
+ * Modified by Ground Plane Studio, LLC, 2026.
+ *
+ * Luckfox Aura + rk628-2x22p (RK628H bridge, two 22-pin FPCs, dual link for 4K60).
+ *
+ * A variant of rv1126b-luckfox-aura.dts that swaps the CSI0 camera stack for
+ * the RK628H HDMI to CSI bridge. This follows Rockchip's own convention (see
+ * rk3576-evb1-v10-rk628-hdmi2csi.dts): a standalone .dts that includes the SoC
+ * and board dtsi files and simply does not include the camera one. No overlay,
+ * because RV1126B U-Boot overlay support is inconsistent and a single DTB
+ * leaves nothing to get wrong.
+ *
+ * Everything below the include block is copied verbatim from
+ * rv1126b-luckfox-aura.dts (SDK 260521, kernel 6.1.141). Luckfox put the board
+ * content in the .dts rather than a .dtsi, so a variant has to carry it: drop
+ * any of it and you lose bootargs, WiFi power sequencing, eMMC or the microSD
+ * slot. Re-diff this against the stock file after any SDK bump.
+ *
+ * `compatible` is deliberately left identical to stock, since the SDK build
+ * system and BoardConfig may match on it. Only `model` changes.
+ *
+ * INSTALL (kernel 6.1.141, branch luckfox-linux-6.1-rv1126b):
+ *
+ *   1. Copy this file and rv1126b-rk628h-dual.dtsi to
+ *        arch/arm64/boot/dts/rockchip/
+ *
+ *   2. Add the 32-bit shim, as every other RV1126B board does.
+ *      arch/arm/boot/dts/rv1126b-luckfox-aura-rk628h-dual.dts:
+ *
+ *        // SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+ *        #include "arm64/rockchip/rv1126b-luckfox-aura-rk628h-dual.dts"
+ *
+ *   3. Add rv1126b-luckfox-aura-rk628h-dual.dtb to arch/arm/boot/dts/Makefile.
+ *
+ *   4. Merge arch/arm/configs/rv1126b-rk628.config, which Rockchip already
+ *      ship:  CONFIG_VIDEO_RK628=y, CONFIG_VIDEO_RK628_CSI=y,
+ *             CONFIG_VIDEO_ROCKCHIP_HDMIRX_CLASS=y, CONFIG_CEC_CORE=y,
+ *             CONFIG_HDMI=y
+ *      Consider =m rather than =y for VIDEO_RK628*: the vendor remove path
+ *      oopses (NULL deref), so a built-in driver cannot be unbound. Modular
+ *      makes iterating on the driver a rmmod instead of a reboot.
+ */
+
+/dts-v1/;
+
+#include "rv1126b.dtsi"
+#include "rv1126b-aoa.dtsi"
+#include "rv1126b-luckfox-aura.dtsi"
+#include "rv1126b-luckfox-aura-dsi.dtsi"
+
+/*
+ * DELIBERATELY NOT INCLUDED: rv1126b-luckfox-aura-cam-csi0.dtsi
+ *
+ * This is the point of the variant, and it is not only about freeing the CSI
+ * lanes. That file:
+ *
+ *   - puts imx415_0@37 on i2c4 with reset-gpios = <&gpio4 RK_PB0>, the exact
+ *     pin the bridge uses for RSTN. Two drivers cannot hold one GPIO: the
+ *     second devm_gpiod_get() returns -EBUSY and the rk628 probe fails, which
+ *     reads as a driver bug rather than a device tree conflict.
+ *   - adds mia1321_0@60 on the same bus, also claiming gpio4 RK_PB0, at the
+ *     opposite polarity.
+ *   - claims <4 RK_PB0 RK_FUNC_GPIO> in a cam_reset_gpio pinctrl group.
+ *   - wires csi2_dphy0 port@0 to those two sensors, which is the input the
+ *     bridge needs.
+ *   - routes rkcif_mipi_lvds on through the ISP and VPSS, which HDMI input
+ *     does not need.
+ *
+ * Its cam_ircut0 node also carries a commented-out led-gpios = <&gpio4 RK_PA0>,
+ * the bridge's INTN pin. Commented out today; worth knowing if it ever is not.
+ */
+
+#include "rv1126b-rk628h-dual.dtsi"
+
+/ {
+	model = "Luckfox Aura + RK628H dual-MIPI";
+	compatible = "rockchip,rv1126b-evb1-v11", "rockchip,rv1126b";
+
+	chosen {
+		bootargs = "earlycon=uart8250,mmio32,0x20810000 console=ttyS4,1500000 console=ttyFIQ0,1500000n8 rw root=PARTUUID=614e0000-0000 rootfstype=ext4 rootwait snd_soc_core.prealloc_buffer_size_kbytes=16 coherent_pool=32K";
+	};
+
+	sdio_pwrseq: sdio-pwrseq {
+		compatible = "mmc-pwrseq-simple";
+		pinctrl-names = "default";
+		pinctrl-0 = <&wifi_enable_h &pcm_out>;
+		post-power-on-delay-ms = <200>;
+		reset-gpios = <&gpio3 RK_PB6 GPIO_ACTIVE_LOW>;
+	};
+
+	wireless-bluetooth {
+		compatible = "bluetooth-platdata";
+		uart_rts_gpios = <&gpio3 RK_PA6 GPIO_ACTIVE_LOW>;
+		pinctrl-names = "default", "rts_gpio";
+		pinctrl-0 = <&uart2m0_rtsn_pins &bt_poweren_gpio>;
+		pinctrl-1 = <&uart2_gpios &bt_poweren_gpio>;
+		BT,wake_gpio     = <&gpio0 RK_PB0 GPIO_ACTIVE_HIGH>;
+		BT,wake_host_irq = <&gpio0 RK_PB1 GPIO_ACTIVE_HIGH>;
+		//BT,power_gpio     = <&gpio3 RK_PB7 GPIO_ACTIVE_HIGH>;
+		status = "okay";
+	};
+
+	wireless-wlan {
+		compatible = "wlan-platdata";
+		rockchip,grf = <&grf>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&wifi_wake_host>;
+		WIFI,host_wake_irq = <&gpio0 RK_PA7 GPIO_ACTIVE_HIGH>;
+		status = "okay";
+	};
+};
+
+/**********MEDIA**********/
+&emmc {
+	bus-width = <8>;
+	cap-mmc-highspeed;
+	non-removable;
+	//mmc-hs200-1_8v;
+	rockchip,default-sample-phase = <90>;
+	no-sdio;
+	no-sd;
+	status = "okay";
+};
+
+&fspi0 {
+	status = "disabled";
+
+	flash@0 {
+		status = "disabled";
+		compatible = "spi-nand";
+		reg = <0>;
+		spi-max-frequency = <75000000>;
+		spi-rx-bus-width = <4>;
+		spi-tx-bus-width = <1>;
+	};
+};
+
+/**********SDMMC**********/
+&sdmmc0 {
+	max-frequency = <52000000>;
+	no-sdio;
+	no-mmc;
+	bus-width = <4>;
+	cap-mmc-highspeed;
+	cap-sd-highspeed;
+	disable-wp;
+	vmmc-supply = <&vcc_sd>;
+	vqmmc-supply = <&vccio_sd>;
+	pinctrl-names = "default";
+
+	pinctrl-0 = <&sdmmc0_clk_pins &sdmmc0_cmd_pins &sdmmc0_detn_pins &sdmmc0_bus4_pins &sdmmc0_pwren>;
+	status = "okay";
+};
+
+&pinctrl {
+	sdmmc0 {
+		sdmmc0_pwren: sdmmc0-pwren {
+			rockchip,pins = <0 RK_PB2 RK_FUNC_GPIO &pcfg_pull_down>;
+		};
+	};
+};
+
+/**********WiFi / BT**********/
+&sdmmc1 {
+	bus-width = <4>;
+
+	cap-sd-highspeed;
+	supports-highspeed;
+	cap-sdio-irq;
+
+	no-sd;
+	no-mmc;
+	max-frequency = <150000000>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&sdmmc1_clk_pins &sdmmc1_cmd_pins &sdmmc1_bus4_pins>;
+	disable-wp;
+
+	keep-power-in-suspend;
+	non-removable;
+
+	mmc-pwrseq = <&sdio_pwrseq>;
+	sd-uhs-sdr104;
+	status = "okay";
+};
+
+&uart2 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&uart2m0_xfer_pins &uart2m0_ctsn_pins>;
+};
+
+/**********PINCTRL**********/
+&pinctrl {
+	sdio-pwrseq {
+		wifi_enable_h: wifi-enable-h {
+			rockchip,pins = <3 RK_PB6 RK_FUNC_GPIO &pcfg_pull_up>;
+		};
+
+		pcm_out: pcm-out {
+			rockchip,pins = <3 RK_PB3 RK_FUNC_GPIO &pcfg_pull_up>;
+		};
+	};
+
+	wireless-bluetooth {
+		uart2_gpios: uart2-gpios {
+			rockchip,pins = <3 RK_PA6 RK_FUNC_GPIO &pcfg_pull_none>;
+		};
+
+		bt_poweren_gpio: bt-poweren-gpio {
+			rockchip,pins = <3 RK_PB7 RK_FUNC_GPIO &pcfg_pull_up>;
+		};
+	};
+
+	wireless-wlan {
+		wifi_wake_host: wifi-wake-host {
+			rockchip,pins = <0 RK_PA7 RK_FUNC_GPIO &pcfg_pull_up>;
+		};
+	};
+};
+
+/*
+ * Kernel console mirrored to UART4 on the 40-pin header (pin 8 = TX GPIO5_A2,
+ * pin 10 = RX GPIO5_A3, pin 6 GND), so a USB-UART can watch boot and catch
+ * hangs. UART0 (ttyFIQ0) is not brought out on a bare Aura.
+ */
+&uart4 {
+	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&uart4m1_xfer_pins>;
+};

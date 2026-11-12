@@ -1,0 +1,98 @@
+// SPDX-License-Identifier: (GPL-2.0+ OR MIT)
+// Copyright (c) 2025 Rockchip Electronics Co., Ltd. (the RV1126B and Luckfox
+// Aura device tree sources this blob was built from), plus the bridge DTS.
+//
+// Excerpt of the Luckfox Aura test unit's LIVE device tree (/sys/firmware/fdt),
+// decompiled on 2026-09-07: the RK628 node, the SAI it feeds, the HDMI-in sound
+// card and the pinctrl groups involved. Phandles are the live numeric values.
+// Model: Luckfox Aura + RK628H
+
+		rk628_csi@50 {
+			reg = <0x50>;
+			compatible = "rockchip,rk628-csi-v4l2";
+			status = "okay";
+			#sound-dai-cells = <0x00>;
+			pinctrl-names = "default";
+			pinctrl-0 = <0x9a>;
+			interrupt-parent = <0x9b>;
+			interrupts = <0x00 0x04>;
+			reset-gpios = <0x9b 0x08 0x01>;
+			continues-clk = <0x01>;
+			rockchip,camera-module-index = <0x00>;
+			rockchip,camera-module-facing = "back";
+			rockchip,camera-module-name = "HDMI-MIPI";
+			rockchip,camera-module-lens-name = "RK628-CSI";
+			phandle = <0x1e9>;
+
+			port {
+
+				endpoint {
+					remote-endpoint = <0x9c>;
+					data-lanes = <0x01 0x02 0x03 0x04>;
+					phandle = <0x16>;
+				};
+			};
+		};
+
+	sai@20970000 {
+		compatible = "rockchip,rv1126b-sai\0rockchip,sai-v1";
+		reg = <0x20970000 0x1000>;
+		interrupts = <0x00 0xb4 0x04>;
+		clocks = <0x02 0x24 0x02 0x13c>;
+		clock-names = "mclk\0hclk";
+		dmas = <0x4b 0x13 0x4b 0x12>;
+		dma-names = "tx\0rx";
+		resets = <0x02 0x40065 0x02 0x40064>;
+		reset-names = "m\0h";
+		#sound-dai-cells = <0x00>;
+		sound-name-prefix = "SAI1";
+		pinctrl-names = "default";
+		pinctrl-0 = <0x61 0x62 0x63>;
+		status = "okay";
+		phandle = <0x112>;
+	};
+
+			rk628-hdmiin-pin {
+				rockchip,pins = <0x04 0x00 0x00 0xf8 0x04 0x08 0x00 0xf8>;
+				phandle = <0x9a>;
+			};
+
+			sai1m2-sclk-pins {
+				rockchip,pins = <0x05 0x15 0x05 0xf8>;
+				phandle = <0x61>;
+			};
+
+			sai1m2-lrck-pins {
+				rockchip,pins = <0x05 0x16 0x05 0xf8>;
+				phandle = <0x62>;
+			};
+
+			sai1m2-sdi-pins {
+				rockchip,pins = <0x05 0x17 0x05 0xf8>;
+				phandle = <0x63>;
+			};
+
+			i2c4m2-pins {
+				rockchip,pins = <0x04 0x07 0x06 0xfd 0x04 0x06 0x06 0xfd>;
+				phandle = <0x99>;
+			};
+
+// HDMI-in sound card node(s):
+7307:		simple-audio-card,name = "rockchip,hdmiin";
+	hdmiin-sound {
+		compatible = "simple-audio-card";
+		simple-audio-card,format = "i2s";
+		simple-audio-card,name = "rockchip,hdmiin";
+		simple-audio-card,bitclock-master = <0x111>;
+		simple-audio-card,frame-master = <0x111>;
+		status = "okay";
+
+		simple-audio-card,cpu {
+			sound-dai = <0x112>;
+		};
+
+		simple-audio-card,codec {
+			sound-dai = <0x113>;
+			phandle = <0x111>;
+		};
+	};
