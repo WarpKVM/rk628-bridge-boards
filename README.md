@@ -60,6 +60,15 @@ The Fusion libraries these boards use, with JLCPCB part numbers, schematic
 frames and power symbols, are in
 [groundplane-studio/fusion-libraries](https://github.com/groundplane-studio/fusion-libraries).
 
+## Disclaimer
+
+These boards and drivers are provided as is, with no warranty of any kind. They are
+reference designs we've tested on the hosts listed above, not certified products.
+Building, modifying or using them is at your own risk: check the design against your
+own requirements, and we're not liable for damage to your hardware, your source devices
+or anything else. The full terms are in the license files (CERN-OHL-S-2.0 for hardware,
+GPL-2.0 for software).
+
 ## Licenses
 
 - Hardware (schematics, layout, gerbers): CERN-OHL-S-2.0, see `LICENSE-HARDWARE`
